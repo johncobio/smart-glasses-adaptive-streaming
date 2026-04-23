@@ -1,0 +1,40 @@
+# Node
+node_modules/
+.expo/
+dist/
+
+# mentraos-mobile large generated directories
+mentraos-mobile/android/
+mentraos-mobile/modules/
+mentraos-mobile/dist/
+
+# Android build artifacts
+android/app/build/
+android/build/
+android/.gradle/
+*.apk
+*.aab
+*.keystore
+
+# mentra-app
+mentra-app/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+glasses_ws_server/__pycache__/
+backend/src/__pycache__/
+
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

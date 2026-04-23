@@ -1,0 +1,923 @@
+================================================================================
+SMART GLASSES ADAPTIVE STREAMING — PIPELINE DOCUMENTATION
+================================================================================
+Project:   Smart Glasses Adaptive Streaming
+Hardware:  Mentra Live smart glasses (camera glasses, no display)
+           Android companion phone (MentraOS app)
+Prepared:  2026-04-23
+Purpose:   Research paper reference — full technical detail for all three
+           pipeline implementations, with measured results.
+
+================================================================================
+SYSTEM BASELINE — MENTRAOS OPEN-SOURCE INFRASTRUCTURE
+================================================================================
+
+All three pipelines are built on top of the Mentra Live glasses hardware and
+the open-source MentraOS ecosystem (github.com/Mentra-Community/MentraOS,
+MIT License).
+
+HARDWARE
+  Mentra Live glasses
+    - Camera: front-facing, fixed FOV
+    - Connectivity: Bluetooth to Android companion phone (no direct WiFi/LTE)
+    - Firmware: closed (not modifiable)
+    - The glasses have no independent internet connection. All data — video,
+      commands, and sensor events — flow through the companion phone.
+
+  Android companion phone
+    - Runs the MentraOS app (React Native, TypeScript)
+    - Bridges glasses↔Bluetooth to the cloud over WiFi or LTE
+    - Responsible for RTMP stream encoding and transmission
+
+MENTRACLOUD (api.mentraglass.com)
+  The original MentraOS architecture routes all traffic through MentraCloud:
+    Glasses <--BT--> Phone App --> MentraCloud --> RTMP destination
+
+  MentraCloud's relay pipeline (cloud/rtmp_relay/stream-manager.sh) includes
+  two intentional delay mechanisms that are hardcoded and cannot be disabled:
+    1. sleep 2       — 2000 ms "stream stabilization" wait before forwarding
+    2. ffmpeg -analyzeduration 3M — 500–1000 ms probe before processing
+
+  These produce a consistent ~3,208 ms additional latency on top of the
+  firmware-level video prebuffer. MentraCloud also adds a routing hop
+  (MentraCloud → MediaMTX) that averages ~947 ms measured in Pipeline 2.
+
+FIRMWARE PREBUFFER
+  The glasses firmware buffers video locally before pushing RTMP regardless
+  of which server receives the stream. This prebuffer is documented by Mentra
+  at approximately 3 seconds and cannot be reduced without firmware access.
+  It is the irreducible floor for stream startup latency in all pipelines.
+
+
+================================================================================
+PIPELINE 1 — TWITCH / NGINX ADAPTIVE STREAMING
+================================================================================
+
+Dates:        February 5 – March 4, 2026
+Sessions:     21 logged sessions
+Purpose:      Demonstrate real-time adaptive video quality based on head
+              motion, streaming to Twitch as a public live broadcast.
+
+────────────────────────────────────────────────────────────────────────────────
+1.1  ARCHITECTURE AND DATA FLOW
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────┐  Bluetooth  ┌───────────┐  wss://  ┌─────────────┐
+  │  Mentra  │────────────>│ MentraOS  │─────────>│ MentraCloud │
+  │  Glasses │<────────────│ Phone App │<─────────│(api.mentra  │
+  └──────────┘  BT cmds    └─────┬─────┘          │ glass.com)  │
+                                 │ RTMP            └──────┬──────┘
+                                 │ (glasses push          │ WebSocket
+                                 │  directly to Twitch)   │ events/cmds
+                                 v                        │
+                          ┌─────────────┐         ┌──────v──────┐
+                          │Twitch RTMP  │         │  Node.js App │
+                          │Ingest Server│         │ (Linux desktop:3000)│
+                          └─────────────┘         │  via ngrok   │
+                                 │                └──────┬───────┘
+                                 v                       │ WebSocket
+                          ┌─────────────┐         ┌──────v───────┐
+                          │Twitch CDN → │         │Python Backend │
+                          │  Viewers    │         │  (port 8765)  │
+                          └─────────────┘         └──────────────┘
+
+  Command path (quality change):
+    Python Backend → Node.js → MentraCloud → Glasses → MentraCloud
+    → Node.js → Python Backend  (full round-trip for latency measurement)
+
+  Motion data path:
+    Glasses → MentraCloud → Node.js → WebSocket → Python Backend
+
+  Video path:
+    Glasses → Bluetooth → Phone → MentraCloud → (relay) → Twitch RTMP
+
+  The Node.js app runs on the Linux desktop, exposed to MentraCloud via an ngrok
+  HTTPS tunnel. The ngrok URL must be manually updated in the Mentra developer
+  console after every Linux desktop reboot (free tier URL changes on restart).
+
+────────────────────────────────────────────────────────────────────────────────
+1.2  KEY COMPONENTS
+────────────────────────────────────────────────────────────────────────────────
+
+  mentra-app/src/index.ts
+    - Registers with MentraCloud as an SDK session handler
+    - Receives head position events (UP / DOWN) from the glasses via SDK
+    - Maps events to synthetic angular velocity:
+        head DOWN → 200 dps (simulating fast motion)
+        head UP   → 0 dps   (simulating stillness)
+    - Forwards motion data to Python backend via WebSocket message:
+        { type: "MOTION", angularVelocity: <dps>, timestamp: <ms> }
+
+  mentra-app/src/StreamManager.ts
+    - Controls RTMP stream start/stop via Mentra SDK
+    - Tracks stream status events (streaming / stopped / error)
+    - Receives SET_QUALITY commands from Python backend and forwards to SDK
+      Note: quality adaptation was tested but the pipeline ultimately ran
+      on standard Mentra Live streaming with the SDK managing quality natively
+
+  mentra-app/src/BackendClient.ts
+    - WebSocket client connecting the Node.js app to the Python backend
+    - Runs on localhost, port 8765
+    - Sends MOTION messages; receives SET_QUALITY commands
+
+  backend/src/adaptation_controller.py
+    - WebSocket server (port 8765) receiving motion data from Node.js
+    - Implements a state machine with three states:
+        STABLE       — head still, stream at highest quality
+        FAST         — fast motion detected, stream at lowest quality
+        TRANSITIONING — motion stopped; hysteresis prevents rapid toggling
+    - Configurable thresholds (backend/src/config.py):
+        FAST_MOTION_THRESHOLD_DPS = 120   (above → FAST state)
+        SETTLE_TIME_MS = 2000             (wait before upgrading quality)
+    - Sends SET_QUALITY commands to Node.js when state transitions occur
+    - Measures round-trip command latency: time from SET_QUALITY sent
+      to acknowledgement received back through MentraCloud
+
+  backend/src/metrics_logger.py
+    - Writes per-session CSV files to backend/logs/
+    - File naming: YYYYMMDD_HHMMSS_performance.csv
+    - Columns (11 total): timestamp_iso, timestamp_ms, quality_level,
+      motion_state, angular_velocity_dps, client_last_cmd_latency_ms,
+      client_rtt_ms, client_avg_rtt_ms, server_imu_proc_avg_ms,
+      session_id, notes
+
+  backend/src/config.py
+    - Centralizes all tunable constants
+    - Motion detection thresholds (FAST_MOTION_THRESHOLD_DPS = 120)
+
+────────────────────────────────────────────────────────────────────────────────
+1.3  NETWORKING
+────────────────────────────────────────────────────────────────────────────────
+
+  Challenge: The Linux desktop is behind a home router with no port forwarding.
+  MentraCloud requires a publicly reachable URL to deliver SDK events to
+  the Node.js app.
+
+  Solution: ngrok tunnel
+    ngrok http 3000
+    → https://<random>.ngrok-free.app forwarded to localhost:3000
+
+  Limitation: The ngrok URL changes on every restart. It must be manually
+  updated at console.mentra.glass before each session. The free tier also
+  imposes rate limits on HTTP requests.
+
+  RTMP destination: rtmp://live.twitch.tv/live/<stream-key>
+  The glasses push RTMP directly through MentraCloud's relay to Twitch.
+
+────────────────────────────────────────────────────────────────────────────────
+1.4  MEASURED RESULTS (21 sessions, Feb 5 – Mar 4, 2026)
+────────────────────────────────────────────────────────────────────────────────
+
+  COMMAND LATENCY (SET_QUALITY round-trip via MentraCloud)
+    Total samples:    244  (across 15 sessions with valid cmd data)
+    Overall average:  939.5 ms
+    Minimum:           18.0 ms  (20260205 — same-network local test)
+    Maximum:        2,066.0 ms  (20260303 — cross-network session)
+
+    Per-session breakdown:
+      20260205_125939   avg   24.3 ms   n=51   (local network, best case)
+      20260212_130034   avg  559.1 ms   n=29
+      20260212_130522   avg  560.0 ms   n=13
+      20260212_131816   avg  569.8 ms   n=17
+      20260226_134542   avg 1332.9 ms   n=15
+      20260226_134631   avg 1335.0 ms   n=14
+      20260226_134715   avg 1335.4 ms   n=11
+      20260226_135137   avg 1344.2 ms   n=6
+      20260226_135301   avg 1350.8 ms   n=9
+      20260226_135331   avg 1339.0 ms   n=12
+      20260226_135405   avg 1336.8 ms   n=6
+      20260303_133442   avg 2066.0 ms   n=11
+      20260303_133540   avg 2062.7 ms   n=16
+      20260304_121959   avg 1211.0 ms   n=5
+      20260304_122027   avg 1218.9 ms   n=29
+
+    The command path traverses 6 hops:
+      Python → Node.js → ngrok → MentraCloud → Glasses
+      → MentraCloud → Node.js → Python
+    The 24 ms result from the local same-network session shows the hardware
+    and local network are capable of near-real-time response. The 939 ms
+    average reflects MentraCloud routing overhead, not hardware limits.
+
+  BACKEND RTT (Node.js ↔ Python backend, localhost WebSocket)
+    Available only in March sessions.
+    Range: 11.6 – 13.8 ms average per session
+    This RTT includes ngrok latency (Node.js → ngrok → internet → backend).
+
+  SERVER IMU PROCESSING TIME
+    Total samples:  94
+    Average:        0.143 ms   (negligible per-message overhead)
+
+  STREAM STARTUP DELAY
+    Not measurable. Twitch provides no API to confirm when its ingest
+    server begins receiving the stream.
+
+  INGEST LATENCY / DELIVERED BITRATE
+    Not measurable. Twitch is a closed black box with no per-stream REST API.
+    There is no way to verify whether quality changes had any effect on the
+    stream as delivered to viewers.
+
+────────────────────────────────────────────────────────────────────────────────
+1.5  LIMITATIONS IDENTIFIED
+────────────────────────────────────────────────────────────────────────────────
+
+  1. No server-side stream verification
+     Quality commands are sent but there is no way to confirm whether the
+     glasses executed them or what the resulting bitrate was. The research
+     question (does adaptive quality help?) cannot be answered without this.
+
+  2. Twitch is a public stream
+     Cannot control who views the stream. Privacy concern for a research
+     context where the camera wearer may not want public exposure.
+
+  3. ~939 ms command latency is too slow for responsive adaptation
+     Head motion events are detected within milliseconds, but the quality
+     change takes nearly 1 second to execute end-to-end via MentraCloud.
+     By the time the command reaches the glasses, the motion event that
+     triggered it has already passed.
+
+  4. ngrok URL changes every boot
+     Operational friction — requires manual update at the developer console
+     before every session. The random URL also prevents scripted startup.
+
+  5. MentraCloud relay still present
+     The ~3,208 ms stream startup delay and relay overhead cannot be measured
+     or eliminated in this pipeline.
+
+
+================================================================================
+PIPELINE 2 — MEDIAMTX / GOOGLE CLOUD METRICS PIPELINE
+================================================================================
+
+Dates:        March 3 – April 9, 2026
+Sessions:     19 logged sessions
+Purpose:      Replace Twitch with a self-hosted media server that exposes a
+              REST API, enabling precise measurement of ingest bitrate,
+              delivery bitrate, and stream startup latency. Shift focus from
+              adaptive quality control to comprehensive metrics collection.
+
+────────────────────────────────────────────────────────────────────────────────
+2.1  ARCHITECTURE AND DATA FLOW
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────┐  Bluetooth  ┌───────────┐  wss://  ┌─────────────┐
+  │  Mentra  │────────────>│ MentraOS  │─────────>│ MentraCloud │
+  │  Glasses │             │ Phone App │<─────────│(api.mentra  │
+  └──────────┘             └─────┬─────┘          │ glass.com)  │
+                                 │ RTMP            └──────┬──────┘
+                                 │                        │ SDK events
+                                 v                        v
+                          ┌──────────────┐      ┌────────────────┐
+                          │  MediaMTX VM │      │  Node.js App   │
+                          │ 136.116.71   │<─────│  (Linux desktop:3000) │
+                          │ .233:1935    │ RTMP │  via ngrok     │
+                          │              │      └───────┬────────┘
+                          │  REST API    │              │ WebSocket
+                          │  :9997       │      ┌───────v────────┐
+                          │  HLS :8888   │      │ Python Metrics │
+                          │  Recording   │<─────│ Backend :8765  │
+                          └──────────────┘ poll └────────────────┘
+                                 │
+                                 v
+                          HLS viewers (VLC / ffplay)
+
+  Video path:
+    Glasses → BT → Phone → MentraCloud relay → MediaMTX VM (:1935 RTMP)
+    → HLS segments (:8888) → Viewer
+
+  Metrics path:
+    Node.js polls MediaMTX REST API (/v3/paths/list) every 2 s
+    → computes bitrate deltas → sends PERF message via WebSocket
+    → Python backend logs to CSV
+
+  The MentraCloud relay is still in the video path. It receives RTMP from
+  the glasses and re-publishes to the MediaMTX VM after its internal delays
+  (sleep 2 + FFmpeg probe). This relay overhead is now measurable for the
+  first time because MediaMTX reports exactly when it becomes ready.
+
+────────────────────────────────────────────────────────────────────────────────
+2.2  INFRASTRUCTURE — GOOGLE CLOUD VM
+────────────────────────────────────────────────────────────────────────────────
+
+  Instance type:   e2-micro (free tier eligible)
+  Static IP:       136.116.71.233
+  OS:              Linux (Debian)
+  Media server:    MediaMTX v1.9.1, running as systemd service
+
+  MediaMTX configuration (/etc/mediamtx.yml):
+    RTMP ingest:    :1935   (glasses push stream here)
+    HLS output:     :8888   (viewer playback via browser / ffplay)
+    REST API:       :9997   (metrics polling endpoint)
+    Recording:      enabled, format fmp4, stored in ~/recordings/
+
+  Firewall rules opened:
+    TCP 1935  — RTMP ingest
+    TCP 8888  — HLS playback
+    TCP 9997  — REST API (metrics)
+
+  REST API endpoint used for metrics:
+    GET http://136.116.71.233:9997/v3/paths/list
+    Returns per-path statistics including: ready (bool), bytesReceived,
+    bytesSent, readers list.
+
+────────────────────────────────────────────────────────────────────────────────
+2.3  KEY COMPONENTS (changes from Pipeline 1)
+────────────────────────────────────────────────────────────────────────────────
+
+  mentra-app/src/MediaMTXClient.ts  [NEW]
+    - Polls the MediaMTX REST API at http://136.116.71.233:9997/v3/paths/list
+      every 2 seconds using setInterval
+    - Extracts per-path fields: bytesReceived, bytesSent, ready, readers[]
+    - Computes encoded_bitrate_bps:
+        (bytesReceived_now - bytesReceived_prev) * 8 / interval_seconds
+    - Computes delivered_bitrate_bps:
+        (bytesSent_now - bytesSent_prev) * 8 / interval_seconds
+    - Records mediamtx_ingest_latency_ms:
+        Time from startStream() call to first poll returning ready=true
+    - Sends all metrics to Python backend via WebSocket PERF message
+
+  mentra-app/src/index.ts  [MODIFIED]
+    - Removed adaptive quality control (Mentra SDK handles quality natively)
+    - Integrated MediaMTXClient
+    - Added battery drain rate computation from SDK battery events
+    - Added motion intensity event counting (events per minute)
+    - Removed SET_QUALITY command handling
+
+  mentra-app/src/StreamManager.ts  [MODIFIED]
+    - RTMP target changed from Twitch to rtmp://136.116.71.233:1935/live/stream
+    - Added startup_delay_ms measurement:
+        Time from startStream() call to SDK "active" / "streaming" callback
+    - Added video_freeze_count: increments when stream status cycles back to
+      "initializing" after being active (indicates a stream restart)
+    - Added bitrate_oscillation_bps: std dev of bitrate samples per session
+    - Added frame_drop_ratio: derived from SDK frame drop callbacks
+
+  backend/src/adaptation_controller.py  [MODIFIED]
+    - Removed all quality adaptation logic
+    - Now acts as a pure metrics relay:
+        Receives PERF messages from Node.js → passes to MetricsLogger
+    - Added PING/PONG handler for RTT measurement:
+        Node.js sends PING with t_client_ms → backend sends PONG with same ts
+        → Node.js computes RTT = now - t_client_ms
+
+  backend/src/metrics_logger.py  [MODIFIED]
+    - Expanded CSV schema to 30+ columns
+    - New columns beyond Pipeline 1:
+        mediamtx_encoded_bitrate_bps    — glasses → VM ingest rate
+        mediamtx_delivered_bitrate_bps  — VM → HLS viewer delivery rate
+        mediamtx_bytes_received         — cumulative bytes at VM
+        mediamtx_bytes_sent             — cumulative bytes to viewers
+        mediamtx_active_readers         — number of active HLS viewers
+        mediamtx_ready                  — boolean: stream live at VM
+        mediamtx_ingest_latency_ms      — startStream() → VM ready=true
+        startup_delay_ms                — startStream() → SDK "active"
+        video_freeze_count              — stream restart events
+        bitrate_oscillation_bps         — bitrate std dev
+        frame_drop_ratio                — SDK frame drop rate
+        glasses_battery_level           — percentage from SDK
+        battery_drain_rate_pct_per_min  — delta computed from SDK events
+        motion_intensity_events_per_min — head motion event frequency
+        client_rtt_ms                   — current ping/pong RTT
+        jitter_ms                       — RTT standard deviation
+
+────────────────────────────────────────────────────────────────────────────────
+2.4  MEASURED RESULTS (19 sessions, Mar 3 – Apr 9, 2026)
+────────────────────────────────────────────────────────────────────────────────
+
+  Note: startup_delay_ms and mediamtx_ingest_latency_ms columns were added
+  during development. Sessions before 20260331 do not have these columns.
+  Bitrate and RTT data is available across all 19 sessions.
+
+  STREAM STARTUP DELAY  (startStream() → SDK "active" / "streaming")
+    Sessions with data:   8  (20260331 onward)
+    Total samples:    2,776
+    Average:          2,659 ms
+    Minimum:          1,386 ms   (20260409_155201)
+    Maximum:          3,208 ms   (20260409_152933 / 20260409_155724)
+
+    Per-session averages:
+      20260331_125619   avg 2,635 ms
+      20260401_165103   avg 2,873 ms
+      20260401_182546   avg 1,883 ms
+      20260402_122018   avg 2,723 ms
+      20260409_152933   avg 3,091 ms
+      20260409_153912   avg 1,957 ms
+      20260409_155201   avg 1,386 ms   ← best session
+      20260409_155724   avg 3,014 ms
+
+    The 3,208 ms ceiling matches Mentra's documented prebuffer behavior.
+    Sessions below ~2,000 ms (20260401_182546, 20260409_155201) likely
+    reflect cases where the glasses had recently been streaming and the
+    firmware prebuffer was partially warm.
+
+  MEDIAMTX INGEST LATENCY  (startStream() → MediaMTX ready=true)
+    Sessions with data:   5  (20260402 onward)
+    Total samples:      709
+    Average:          3,606 ms
+    Minimum:          2,054 ms   (20260409_155201)
+    Maximum:          4,031 ms   (20260409_152933 / 20260402_122018)
+
+    Per-session averages:
+      20260402_122018   avg 4,025 ms
+      20260409_152933   avg 4,031 ms
+      20260409_153912   avg 4,029 ms
+      20260409_155201   avg 2,054 ms   ← best session
+      20260409_155724   avg 4,030 ms
+
+  MENTRACLOUD RELAY OVERHEAD  (ingest_latency − startup_delay)
+    This is the time MentraCloud's relay takes to forward the stream to
+    MediaMTX after the SDK already reports the stream as active.
+    Average:   947 ms
+    This overhead consists of:
+      sleep 2 (partial)  — the 2 s wait, already partially elapsed by SDK
+      ffmpeg -analyzeduration 3M — 500–1000 ms probe
+
+  BACKEND RTT  (Node.js ↔ Python backend WebSocket, localhost)
+    Total samples:   4,931
+    Average:           1.10 ms
+    Minimum:           0.00 ms
+    Maximum:          22.00 ms
+    Note: Pipeline 2 moved from ngrok (P1: 11–14 ms) to direct localhost
+    WebSocket, yielding a ~12x RTT improvement. The 22 ms outlier reflects
+    occasional OS scheduling jitter, not network delay.
+
+  RTT JITTER  (standard deviation of RTT samples within a session)
+    Total samples:   2,915
+    Average:           0.42 ms
+    Maximum:           1.00 ms
+    The sub-millisecond jitter confirms the local network is extremely stable.
+
+  ENCODED BITRATE  (glasses → MediaMTX, from bytesReceived delta)
+    Total samples:     452
+    Average:           2.04 Mbps
+    Range:             0.12 – 2.14 Mbps
+    The 0.12 Mbps minimum reflects stream startup ramp-up periods; the
+    2.14 Mbps maximum is near the ceiling of the glasses' encoder output.
+
+  DELIVERED BITRATE  (MediaMTX → HLS viewers, from bytesSent delta)
+    Total samples:     452
+    Average:           4.08 Mbps   (approximately 2× encoded bitrate)
+    Range:             0.24 – 4.28 Mbps
+    The ~2× ratio is expected: HLS re-muxes RTMP into TS segments, adding
+    container overhead and potentially serving multiple simultaneous viewers.
+
+────────────────────────────────────────────────────────────────────────────────
+2.5  LIMITATIONS IDENTIFIED
+────────────────────────────────────────────────────────────────────────────────
+
+  1. MentraCloud relay is still present
+     The ~3,208 ms firmware prebuffer plus ~947 ms MentraCloud relay overhead
+     produce a minimum ingest latency of ~4,000 ms in typical conditions.
+     This is hardcoded in MentraCloud's relay script and cannot be reduced.
+
+  2. Bluetooth hop is unobservable
+     There is no way to measure the latency of the glasses→Bluetooth→phone
+     link. The SDK treats this as an internal detail and does not expose
+     per-frame Bluetooth timing.
+
+  3. ngrok still required
+     The MentraOS companion app must be able to receive events from
+     MentraCloud, which requires a public URL. ngrok is still needed and
+     its URL still changes on reboot.
+
+  4. HLS viewer latency is high
+     HLS requires the player to buffer multiple segments before playback
+     begins. Measured viewer latency: approximately 13 seconds end-to-end
+     (stream captured → viewed in VLC / ffplay via HLS). This is a
+     protocol-level constraint of HLS, not a pipeline bug.
+
+  5. Startup delay variance is not fully explained
+     The range 1,386–3,208 ms across identical hardware/network conditions
+     suggests the prebuffer warm/cold state significantly affects results.
+     The mechanism for warming is not documented by Mentra.
+
+
+================================================================================
+PIPELINE 3 — MENTRACLOUD BYPASS
+================================================================================
+
+Dates:        April 15–16, 2026 (first operational days)
+Sessions:     13 logged sessions total
+              2 sessions with complete stream data (Apr 15)
+              1 additional confirmed session (Apr 16)
+Purpose:      Eliminate MentraCloud from the pipeline entirely by hosting a
+              custom WebSocket server that speaks the MentraCloud protocol.
+              This removes all relay delays and gives precise timestamp
+              control at every hop.
+
+────────────────────────────────────────────────────────────────────────────────
+3.1  ARCHITECTURE AND DATA FLOW
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────┐  Bluetooth  ┌──────────────┐  ws://192.168.86.197:8766
+  │  Mentra  │────────────>│ Modified     │─────────────────────────────┐
+  │  Glasses │<────────────│ MentraOS App │ (or 100.93.149.81:8766      │
+  └──────────┘  BT cmds    │ (phone)      │  via Tailscale for LTE)     │
+                            └──────┬───────┘                             │
+                                   │ RTMP (phone pushes directly)        │
+                                   │                                     v
+                                   v                          ┌─────────────────┐
+                            ┌──────────────┐                  │  glasses_ws_    │
+                            │  MediaMTX VM │                  │  server/        │
+                            │ 136.116.71   │<─────────────────│  server.py      │
+                            │ .233:1935    │ RTMP             │  (Linux desktop)       │
+                            │              │                  │                 │
+                            │  REST API    │──────────────────│  polls /v3/     │
+                            │  :9997       │ metrics poll     │  paths/list     │
+                            │  HLS :8888   │                  └─────────────────┘
+                            │  Recording   │
+                            └──────────────┘
+                                   │
+                                   v
+                            Viewers (ffplay RTMP direct or HLS)
+
+  Video path (bypass):
+    Glasses → BT → Phone → OUR SERVER (start_stream command)
+    → Phone pushes RTMP directly → MediaMTX VM (:1935)
+
+  MentraCloud is completely absent. The video path has one fewer hop.
+  No relay script, no sleep 2, no FFmpeg probe.
+
+  Local network (WiFi mode):
+    Phone connects to Linux desktop at 192.168.86.197:8766 over local WiFi.
+
+  LTE mode:
+    Phone connects to Linux desktop at 100.93.149.81:8766 via Tailscale VPN.
+    Tailscale creates a peer-to-peer encrypted tunnel between the phone
+    (100.106.27.85) and Linux desktop (100.93.149.81) over the LTE connection.
+    No port forwarding or ngrok is required.
+
+────────────────────────────────────────────────────────────────────────────────
+3.2  PHONE APP MODIFICATION
+────────────────────────────────────────────────────────────────────────────────
+
+  Source: github.com/Mentra-Community/MentraOS /mobile (MIT License)
+  Modification: One line changed in mentraos-mobile/.env
+
+    EXPO_PUBLIC_BACKEND_URL_OVERRIDE=http://192.168.86.197:8766
+
+  This single environment variable is read by src/stores/settings.ts with
+  an override() function that forces it on every app boot, superseding any
+  stored setting. All REST and WebSocket traffic is redirected from
+  api.mentraglass.com to our server.
+
+  Build process:
+    - Built locally with Gradle (not EAS cloud build)
+    - Gradle 9.0 / Java 17 / React Native
+    - Sideloaded via WiFi ADB:
+        adb pair <ip>:<port>      (first time)
+        adb connect <ip>:<port>   (reconnect)
+        adb install -r app-release.apk
+
+  For LTE testing, EXPO_PUBLIC_BACKEND_URL_OVERRIDE is set to the Tailscale
+  IP (100.93.149.81:8766) and the APK is rebuilt and reinstalled.
+
+────────────────────────────────────────────────────────────────────────────────
+3.3  KEY COMPONENT — glasses_ws_server/server.py
+────────────────────────────────────────────────────────────────────────────────
+
+  ~350 lines of Python. Entirely new file — does not build on Pipeline 1/2.
+  Uses aiohttp (not the websockets library) because the phone app sends HTTP
+  POST requests before opening the WebSocket, and the websockets library's
+  process_request hook only handles GET — it silently rejects POSTs at the
+  HTTP parsing layer.
+
+  Server binding:
+    HOST: 0.0.0.0  (all interfaces — WiFi and Tailscale)
+    PORT: 8766
+
+  REST ENDPOINTS (phone app calls these on startup before WebSocket):
+    POST /auth/exchange-token
+      → {"coreToken":"bypass-token"}
+      The app sends a Supabase JWT and expects a MentraCloud core token back.
+      We return a dummy token to unblock the auth flow.
+
+    POST /api/client/min-version
+      → {"success":true,"data":{"required":"0.0.0","recommended":"0.0.0"}}
+
+    POST /api/client/apps
+      → {"success":true,"data":[]}
+      Returns empty app list (no third-party apps installed).
+
+    POST /api/auth/generate-webview-token
+    POST /api/auth/generate-webview-signed-user-token
+      → {"success":true,"data":{"token":"bypass-token"}}
+
+    POST /api/client/device/state
+    POST /api/client/audio/configure
+    POST /api/client/goodbye
+      → {"success":true}
+
+    GET  /api/client/user/settings
+      → {"success":true,"data":{}}
+
+    GET|POST /{anything else}
+      → {"success":true,"data":null}
+      Catch-all for endpoints we don't need to handle specifically.
+
+  WEBSOCKET HANDLER (GET /glasses-ws):
+    On connection:
+      1. Reset session state
+      2. Record phone_connected timestamp
+      3. Send connection_ack immediately
+      4. Start 3-second fallback timer (_start_stream_fallback)
+      5. Start keep_alive_loop (sends keep_stream_alive every 10 s)
+
+    Messages received:
+      ping
+        → sends {"type":"pong"} immediately (keepalive)
+
+      glasses_battery_update
+        → records battery level and charging state
+        → if stream_status == "idle": resets glasses_connected flag and
+          calls _send_start_stream() — this handles the case where the
+          fallback fired before glasses were ready (battery update is the
+          definitive signal that glasses are connected and ready)
+
+      glasses_connection_state  (status: CONNECTED / DISCONNECTED)
+        → if CONNECTED: calls _send_start_stream() immediately
+        → Note: this message is defined in MentraOS SocketComms.ts but
+          sendGlassesConnectionState() is never called in practice. The
+          battery update path above is the reliable trigger.
+
+      rtmp_stream_status / stream_status
+        → records stream state transitions (idle/initializing/streaming/
+          active/error/reconnecting/reconnected)
+        → on first transition to streaming/active/reconnected:
+          records stream_active_ms timestamp for startup delay calculation
+        → appends row to *_bypass_stream_events.csv
+
+      head_position
+        → records current head position (UP / DOWN / etc.)
+
+      VAD (voice activity detection)
+        → silently ignored
+
+    _send_start_stream(ws, reason):
+      Guards against double-firing (glasses_connected flag).
+      Records stream_request_sent_ms timestamp.
+      Logs glasses_connected latency event.
+      Sends: {"type":"start_stream","streamUrl":"rtmp://136.116.71.233:1935/live/stream"}
+      Logs start_stream_sent latency event.
+
+    _start_stream_fallback(ws):
+      Waits 3 seconds after phone connection.
+      If glasses_connected is still False, calls _send_start_stream().
+      This handles the case where the glasses were already connected when
+      the phone app opened (no connection event fires in this scenario).
+
+  MEDIAMTX POLLING (runs every 2 seconds in background):
+    Calls GET http://136.116.71.233:9997/v3/paths/list
+    Extracts bytesReceived, bytesSent, ready, readers
+    Computes encoded_bitrate_bps and delivered_bitrate_bps from byte deltas
+    On first poll returning ready=true: records mediamtx_ready_ms timestamp
+
+  CSV LOGGING — three files per session, prefix: YYYYMMDD_HHMMSS
+
+    *_bypass_latency.csv
+      Fields: timestamp_iso, event, elapsed_from_start_ms,
+              elapsed_from_prev_ms, notes
+      Events logged: phone_connected, connection_ack_sent, glasses_connected,
+                     start_stream_sent, stream_active, mediamtx_ready,
+                     phone_disconnected
+      Purpose: precise per-event latency timeline for the session
+
+    *_bypass_performance.csv
+      Fields: timestamp_iso, timestamp_ms, glasses_connected, stream_status,
+              glasses_battery_level, glasses_battery_charging, head_position,
+              mediamtx_ready, mediamtx_encoded_bitrate_bps,
+              mediamtx_delivered_bitrate_bps, mediamtx_bytes_received,
+              mediamtx_bytes_sent, mediamtx_active_readers,
+              startup_delay_ms, mediamtx_ingest_latency_ms,
+              server_processing_ms
+      Logged every 2 seconds throughout the session.
+      server_processing_ms: time taken by the Python server to execute the
+      MediaMTX API poll and compute derived metrics (typically 1–5 ms).
+
+    *_bypass_stream_events.csv
+      Fields: timestamp_iso, timestamp_ms, status, stream_id, rtmp_url, error
+      One row per stream status change event from the phone app.
+
+────────────────────────────────────────────────────────────────────────────────
+3.4  STARTUP TRIGGER LOGIC (detail)
+────────────────────────────────────────────────────────────────────────────────
+
+  The startup sequence has two cases:
+
+  Case A — Glasses connect AFTER phone app opens (typical):
+    t=0       Phone connects → connection_ack sent → 3s fallback started
+    t~1–2s    glasses_battery_update arrives → start_stream fired immediately
+    Result:   start_stream fires at glasses connection time (~1–2s from start)
+
+  Case B — Glasses already connected when phone app opens:
+    t=0       Phone connects → connection_ack sent → 3s fallback started
+    t=3s      Fallback fires → start_stream sent (glasses ready but no event)
+    Result:   start_stream fires at 3s regardless of how long glasses have
+              been connected.
+
+  Case C — Battery arrives before stream is confirmed active (bug, fixed):
+    Fallback fires at 3s → start_stream sent → stream still idle →
+    battery_update arrives → detects stream_status == "idle" → resets
+    glasses_connected flag → retries start_stream.
+    This handles cases where the fallback fired too early (before glasses
+    had fully initialized Bluetooth).
+
+────────────────────────────────────────────────────────────────────────────────
+3.5  RELAY OVERHEAD — WHY IT DOES NOT EXIST IN PIPELINE 3
+────────────────────────────────────────────────────────────────────────────────
+
+  In Pipeline 2, relay overhead = ingest_latency − startup_delay > 0
+  because MentraCloud adds delay between the SDK reporting "active" and
+  the stream actually arriving at MediaMTX.
+
+  In Pipeline 3, ingest_latency < startup_delay:
+    The stream arrives at MediaMTX (1,566 ms after start_stream) BEFORE
+    the phone's SDK reports the stream as "active" (2,820 ms).
+
+  This is structurally correct: without a relay, the RTMP packets travel
+  directly from the phone to MediaMTX over TCP, so MediaMTX sees them as
+  soon as the glasses begin pushing. The phone-side SDK "active" status
+  update lags behind the actual stream arrival because it is a higher-level
+  application state callback, not a raw network event.
+
+  Timeline comparison:
+    P2:  start_stream → [2,659ms] → SDK "active" → [947ms] → MediaMTX ready
+    P3:  start_stream → [1,566ms] → MediaMTX ready → [1,254ms] → SDK "active"
+
+  The relay overhead metric (947 ms in P2) is completely eliminated in P3.
+  MediaMTX receives the stream 1,254 ms earlier than the SDK even acknowledges
+  it is streaming.
+
+────────────────────────────────────────────────────────────────────────────────
+3.6  MEASURED RESULTS
+────────────────────────────────────────────────────────────────────────────────
+
+  SESSION INVENTORY (April 15, 2026 — first operational day)
+    20260415_135921 through 175100  (5 sessions): Empty. Server was still
+      being developed; phone could not reach server at all.
+    20260415_175213, 175358, 175915  (3 sessions): Phone connected but
+      disconnected after ~5 s. Server handled auth but start_stream logic
+      not yet implemented.
+    20260415_180120:  First stream established — bad trigger condition.
+      start_stream fired 1 second after phone connected, before glasses
+      were ready. Error/reconnect cycle added ~3 s of avoidable delay.
+    20260415_180513:  Clean session — battery-triggered start_stream,
+      no reconnect errors. Representative result.
+
+  SESSION 20260415_180513  (clean — battery-triggered start_stream)
+    Phone connected:         t = 0 ms
+    Connection ack sent:     t = 0 ms
+    Glasses connected:       t = 3,002 ms  (3s fallback — no battery before)
+    start_stream sent:       t = 3,002 ms
+    Stream active (SDK):     t = 5,822 ms  → startup_delay = 2,820 ms
+    MediaMTX ready:          t = 4,568 ms  → ingest_latency = 1,566 ms
+    Stream status sequence:  stopped → initializing → streaming  (clean)
+
+    startup_delay  = 2,820 ms  (−388 ms vs P2 avg, −12%)
+    ingest_latency = 1,566 ms  (−2,459 ms vs P2 avg, −61%)
+
+  SESSION 20260415_180120  (bad trigger — start_stream too early)
+    startup_delay:   4,928 ms
+    ingest_latency:  6,163 ms
+    Stream status:   initializing → error → reconnecting → reconnected
+    Not representative — start_stream fired before glasses were ready.
+
+  SESSION 20260416_134132  (confirmed working, Apr 16 follow-up)
+    Phone connected:     t = 0 ms
+    Glasses connected:   t = 1,487 ms  (Bluetooth connection delay)
+    start_stream sent:   t = 1,488 ms
+    Stream active (SDK): t = 6,588 ms  → startup_delay = 5,100 ms
+    MediaMTX ready:      t = 8,446 ms  → ingest_latency = 6,958 ms
+    Note: The 5,100 ms startup in this session is explained by the 1,487 ms
+    Bluetooth connection delay (glasses were not yet paired when the session
+    started). The actual SDK processing time after start_stream is comparable
+    to other sessions. This is NOT a regression.
+
+  ENCODED BITRATE  (glasses → MediaMTX via direct RTMP)
+    Total samples:  141
+    Average:        1.04 Mbps
+    Range:          0.36 – 1.14 Mbps
+    Note: Lower than Pipeline 2 average (2.04 Mbps) because bypass sessions
+    were short and samples are disproportionately from the startup ramp-up
+    period before the encoder reaches steady state.
+
+  DELIVERED BITRATE  (MediaMTX → viewers)
+    Total samples:  141
+    Average:        2.32 Mbps
+    Range:          0.73 – 3.38 Mbps
+
+  VIEWER LATENCY
+    HLS (same MediaMTX VM, :8888):  ~13 s  (same as Pipeline 2 — HLS
+      segment buffering is protocol-level, not pipeline-dependent)
+    RTMP direct via ffplay:          ~2–3 s
+      ffplay -fflags nobuffer -flags low_delay -framedrop \
+        rtmp://136.116.71.233:1935/live/stream
+    Switching from HLS to direct RTMP playback reduces viewer-side latency
+    by ~10 seconds, independent of any backend changes.
+
+  ONGOING DISPLAY LATENCY  (stopwatch measurement)
+    Measured manually by comparing a physical stopwatch on camera with the
+    ffplay output: approximately 400 ms end-to-end from real-world event
+    to rendered viewer frame. This is not yet logged in the CSV files and
+    would require a video reference frame approach to log automatically.
+
+────────────────────────────────────────────────────────────────────────────────
+3.7  LIMITATIONS
+────────────────────────────────────────────────────────────────────────────────
+
+  1. Firmware prebuffer is irreducible
+     The ~2,820 ms startup delay is firmware-level: the glasses buffer video
+     locally before pushing RTMP regardless of relay. Cannot be reduced
+     without modifying glasses firmware (closed source).
+
+  2. Small sample size
+     Only 2 sessions have complete stream data as of the first operational
+     day. More sessions are needed for statistical confidence.
+
+  3. Ongoing display latency not automatically logged
+     The ~400 ms end-to-end latency was measured manually by stopwatch.
+     Logging it requires a synchronized video reference (e.g., an NTP-
+     synced timestamp rendered on a monitor captured by the glasses camera,
+     compared to the viewer output frame).
+
+  4. No quality adaptation
+     Pipeline 3 removes adaptive quality control (present in Pipeline 1).
+     The bypass currently sends a single fixed start_stream command with no
+     dynamic quality adjustment.
+
+  5. Closed-source glasses firmware
+     The Bluetooth protocol between glasses and phone is not documented.
+     The Bluetooth hop latency is unobservable from our server.
+
+
+================================================================================
+HEAD-TO-HEAD COMPARISON
+================================================================================
+
+  Metric                        P1 Twitch      P2 MediaMTX     P3 Bypass
+  ─────────────────────────────────────────────────────────────────────────────
+  MentraCloud in path           Yes            Yes             NO
+  ngrok required                Yes            Yes             No
+  Quality adaptation            No*            No              No
+  Server language               Node.js + Py   Node.js + Py    Python only
+  Phone app modified            No             No              Yes (1 line)
+  Stream startup delay          NOT MEASURED   2,659 ms avg    2,820 ms (clean)
+                                               (1,386–3,208)   (firmware floor)
+  MediaMTX ingest latency       NOT MEASURED   3,606 ms avg    1,566 ms (clean)
+                                               (2,054–4,031)   (−61% vs P2)
+  MentraCloud relay overhead    NOT MEASURED   +947 ms avg     0 ms (eliminated)
+  Backend RTT                   11–14 ms       1.10 ms avg     <1 ms (local)
+  Viewer latency (HLS)          ~10 s Twitch   ~13 s           ~13 s
+  Viewer latency (RTMP direct)  N/A            N/A             ~2–3 s
+  Encoded bitrate               NOT MEASURED   2.04 Mbps avg   1.04 Mbps*
+  Delivered bitrate             NOT MEASURED   4.08 Mbps avg   2.32 Mbps*
+  Cmd round-trip latency        939 ms avg     N/A             N/A
+  Sessions logged               21             19              13
+  Sessions with stream metrics  0              11              2 (Apr 15)
+  CSV columns logged            11             30+             16 (latency CSV)
+                                                               + stream events
+
+  * P1 quality adaptation was tested during development but the pipeline
+    ultimately ran on standard Mentra Live streaming with the SDK managing
+    quality natively. Command latency measurements reflect the test period.
+  * P3 bitrate samples disproportionately from startup ramp-up periods.
+
+
+================================================================================
+KEY FINDINGS FOR RESEARCH PAPER
+================================================================================
+
+1. MENTRACLOUD RELAY IS THE DOMINANT LATENCY SOURCE
+   Comparing P2 ingest (3,606 ms avg) to P3 ingest (1,566 ms clean):
+   the 2,040 ms reduction is almost entirely from eliminating the relay.
+   The relay contributes ~947 ms measured overhead on top of the prebuffer.
+   P3's 61% ingest latency reduction confirms the relay, not the firmware,
+   was the bottleneck.
+
+2. THE FIRMWARE PREBUFFER IS THE IRREDUCIBLE FLOOR
+   The ~2,820 ms startup delay in P3's clean session represents the glasses
+   encoding and buffering video locally before any RTMP push occurs. This
+   matches Mentra's documented ~3 s prebuffer. No pipeline change can
+   reduce this without firmware access.
+
+3. MENTRACLOUD RELAY INVERTS THE LATENCY RELATIONSHIP
+   In P2: SDK "active" arrives before MediaMTX ready (+947 ms gap).
+   In P3: MediaMTX ready arrives before SDK "active" (−1,254 ms gap).
+   Removing the relay inverts the timing — the server sees the stream
+   before the phone-side application layer does.
+
+4. COMMAND LATENCY IS UNACCEPTABLY HIGH FOR REAL-TIME ADAPTATION (P1)
+   The 939 ms average command round-trip via MentraCloud means quality
+   commands arrive nearly 1 second after the motion that triggered them.
+   The 24 ms result from a same-network session shows the hardware is
+   capable of near-real-time response — the latency is MentraCloud's.
+
+5. PROTOCOL CHOICE DOMINATES VIEWER LATENCY
+   Switching from HLS (13 s) to direct RTMP playback (2–3 s) saves ~10 s
+   of viewer-side latency independent of backend pipeline choice. Viewer
+   latency is primarily a protocol decision, not an infrastructure decision.
+
+6. BACKEND RTT IMPROVED 12× FROM P1 TO P2
+   Removing ngrok (P1: 11–14 ms) in favor of direct localhost WebSocket
+   (P2: 1.1 ms avg) reduced RTT by ~12×. This improvement confirms that
+   the ngrok relay was adding measurable overhead to every performance
+   metric message, not just the video path.

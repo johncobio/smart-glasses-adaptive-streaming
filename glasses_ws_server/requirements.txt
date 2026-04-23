@@ -1,0 +1,1 @@
+websockets>=12.0  # uses websockets.asyncio.server API (tested with v16.0)

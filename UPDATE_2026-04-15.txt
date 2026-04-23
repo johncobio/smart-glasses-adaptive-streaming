@@ -1,0 +1,128 @@
+UPDATE — CLOUD BYPASS FIRST LIVE TEST
+======================================
+Date: 2026-04-15
+Project: Smart Glasses Adaptive Streaming (MediaMTX pipeline)
+
+
+========================================
+WHAT WE DID TODAY
+========================================
+
+1. Got the custom WebSocket server (glasses_ws_server/server.py) fully working
+   by fixing a series of build and server compatibility issues.
+
+2. Built and sideloaded the modified MentraOS phone app (bypasses MentraCloud)
+   onto the Android phone via WiFi ADB.
+
+3. Ran the first successful live bypass session — glasses streaming directly
+   to MediaMTX VM without going through MentraCloud.
+
+
+========================================
+FIXES MADE THIS SESSION
+========================================
+
+mentraos-mobile build fixes:
+  - scripts/set-build-env.mjs: graceful fallback for missing git repo
+  - metro.config.js: removed missing cloud/packages/types/src watch path (now restored)
+  - cloud/packages/types/: fetched missing package via sparse git clone,
+    built dist/ with tsc (fixed ignoreDeprecations: "6.0" in tsconfig.json)
+  - android/local.properties: created with sdk.dir=/home/rxk2803/Android/Sdk
+  - Installed Java 17 (was on 11, Gradle 9 requires 17)
+  - Installed ninja-build (required for react-native-screens and lc3Lib C++ builds)
+  - APK signed with debug key (no release keystore present — fine for research)
+
+glasses_ws_server/server.py fixes:
+  - Rewrote server from websockets library to aiohttp.
+    Root cause: websockets library rejects HTTP POST at the protocol level
+    before process_request hook can intercept it. aiohttp handles both
+    REST (POST/GET) and WebSocket on the same port correctly.
+  - Added /auth/exchange-token → returns {"coreToken":"bypass-token"}
+    (app exchanges Supabase token here; we return a dummy to unblock auth flow)
+  - Added /api/auth/generate-webview-token and generate-webview-signed-user-token
+    → returns {"success":true,"data":{"token":"bypass-token"}}
+  - Added ping → pong handler (app disconnects after 5s without pong)
+  - Fixed start_stream trigger: app never sends glasses_connection_state
+    over WebSocket (sendGlassesConnectionState() is defined but uncalled).
+    Instead, battery update (glasses_battery_update) is used as the trigger.
+    Added 3s fallback if no battery update arrives (glasses already connected).
+
+
+========================================
+LATENCY RESULTS — FIRST BYPASS SESSION
+========================================
+
+  Metric                          Bypass      Baseline    Delta
+  ------------------------------  ----------  ----------  ----------
+  Stream startup delay            2820ms      3208ms      -388ms  (-12%)
+  MediaMTX ingest latency         1566ms      4025ms      -2459ms (-61%)
+  Viewer latency (RTMP direct)    ~2-3s       ~13s        ~10s improvement
+
+Viewer note: HLS playback adds 6-8s of buffering on top of ingest latency.
+Switching to direct RTMP playback with ffplay eliminates this entirely:
+  ffplay -fflags nobuffer -flags low_delay -framedrop rtmp://136.116.71.233:1935/live/stream
+
+
+========================================
+INTERPRETATION
+========================================
+
+The 61% reduction in ingest latency confirms that MentraCloud's relay was
+the dominant source of delay — not the hardware or network.
+
+The remaining ~2820ms startup delay is firmware-level behavior:
+  - Mentra glasses buffer ~3s of video locally before pushing RTMP
+  - This is documented in Mentra's platform as an intentional prebuffer
+  - Cannot be reduced without modifying glasses firmware
+
+The MentraCloud relay added on top of this prebuffer via:
+  - sleep 2 stabilization wait (~2000ms)
+  - FFmpeg -analyzeduration probe (~500-1000ms)
+  Both are now eliminated by the bypass.
+
+
+========================================
+KNOWN ISSUES / NEXT STEPS
+========================================
+
+  1. Battery data not arriving in server logs (battery_level = None).
+     Likely because glasses are connected before the WebSocket session
+     starts so no battery event fires. Need to investigate whether
+     sendBatteryStatus() can be triggered on-demand or via REST.
+
+  2. start_stream is firing via 3s fallback (not battery trigger) because
+     glasses are connected before the session. Consider querying glasses
+     state via REST /api/client/device/state on connect instead.
+
+  3. Run multiple sessions to get stable average latency measurements.
+     One session is not enough for a paper result.
+
+  4. Download VM recordings for PSNR/SSIM video quality analysis:
+     gcloud compute scp mediamtx-server:/home/johncobioinfo/recordings/*.mp4 \
+       ~/recordings/ --zone=us-central1-a
+
+  5. Run latency analyzer on today's CSV:
+     python3 backend/src/analyze_latency.py \
+       --log backend/logs/20260415_180513_bypass_performance.csv
+
+
+========================================
+KEY FILES CHANGED TODAY
+========================================
+
+  glasses_ws_server/server.py              Full rewrite — aiohttp, all fixes
+  mentraos-mobile/scripts/set-build-env.mjs  git fallback
+  mentraos-mobile/metro.config.js          watch folder fix
+  mentraos-mobile/android/local.properties Created — SDK path
+  cloud/packages/types/                    Fetched from MentraOS repo
+  cloud/packages/types/tsconfig.json       ignoreDeprecations fix
+  cloud/packages/types/dist/               Built (tsc output)
+
+
+========================================
+SESSION LOG FILES
+========================================
+
+  backend/logs/20260415_180513_bypass_performance.csv
+  backend/logs/20260415_180513_bypass_latency.csv
+  backend/logs/20260415_180513_bypass_stream_events.csv

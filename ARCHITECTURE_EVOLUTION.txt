@@ -1,0 +1,363 @@
+================================================================================
+SMART GLASSES STREAMING — ARCHITECTURE EVOLUTION
+================================================================================
+Project: Smart Glasses Adaptive Streaming
+Prepared: 2026-04-16
+
+This document describes what is architecturally and technically different
+across the four versions of the system, from the original open-source MentraOS
+baseline through each iteration we built.
+
+================================================================================
+BASELINE — ORIGINAL OPEN-SOURCE MENTRAOS
+================================================================================
+
+Source: https://github.com/Mentra-Community/MentraOS (MIT License)
+Components: /asg_client (firmware), /mobile (Android phone app), /cloud (backend)
+
+HOW IT WORKS
+  Glasses <--Bluetooth--> Android Phone App --> MentraCloud --> RTMP destination
+
+  The glasses have no direct internet connection. They connect via Bluetooth
+  to the MentraOS companion app on an Android phone. The phone app forwards
+  all data (video, commands, sensor events) through MentraCloud
+  (wss://uscentralapi.mentra.glass), which acts as the central relay.
+
+  MentraCloud's relay pipeline (/cloud/rtmp_relay/stream-manager.sh) receives
+  the RTMP stream from the glasses and re-publishes it to whatever destination
+  is configured. It includes two intentional delay mechanisms:
+    - sleep 2        → 2000ms "stream stabilization" wait before forwarding
+    - FFmpeg -analyzeduration 3M → 500-1000ms probe before processing starts
+
+  These artificial delays result in a consistent ~3208ms stream startup latency
+  that cannot be reduced or disabled through the SDK.
+
+WHAT WE USED FROM IT
+  - The glasses hardware and firmware (unchanged)
+  - The MentraOS WebSocket protocol (documented in SocketComms.ts)
+  - The phone app as the starting point for our modified version (Pipeline 3)
+
+WHAT WE DID NOT USE
+  - MentraCloud (replaced in Pipeline 3)
+  - The original cloud backend
+  - Any streaming destination or viewer infrastructure
+
+
+================================================================================
+PIPELINE 1 — TWITCH / NGINX ADAPTIVE STREAMING
+================================================================================
+
+Files:     mentra-app/   (Node.js, TypeScript)
+           backend/      (Python)
+Architecture doc: ARCHITECTURE.txt
+
+PURPOSE
+  Demonstrate adaptive video quality based on head motion. When the user moves
+  their head fast (motion blur), downgrade bitrate/resolution. When still,
+  upgrade to highest quality. Streamed to Twitch as a public demonstration.
+
+DATA FLOW
+  Glasses --> MentraCloud --> Node.js App (laptop:3000, via ngrok)
+                                  |
+                                  | WebSocket (ws://localhost:8765)
+                                  v
+                         Python Adaptation Backend
+                                  |
+                                  | SET_QUALITY commands
+                                  v
+                         Node.js --> MentraCloud --> Glasses (change quality)
+                                  |
+                                  | RTMP (glasses push directly)
+                                  v
+                            Twitch RTMP Server --> Viewers
+
+KEY COMPONENTS WE WROTE
+
+  mentra-app/src/index.ts
+    - Mentra SDK session handler
+    - Maps head position events (up/down) to angular velocity values
+      (head DOWN = 200 dps, head UP = 0 dps)
+    - Forwards motion data to Python backend via WebSocket
+
+  mentra-app/src/StreamManager.ts
+    - Controls RTMP stream start/stop via Mentra SDK
+    - Handles quality level changes (calls SDK setQuality())
+    - Tracks stream status events from SDK
+
+  mentra-app/src/BackendClient.ts
+    - WebSocket client connecting Node.js to the Python backend (port 8765)
+    - Sends motion data; receives SET_QUALITY commands
+
+  backend/src/adaptation_controller.py
+    - WebSocket server receiving motion data from Node.js
+    - State machine: STABLE / FAST / TRANSITIONING
+    - Hysteresis logic to prevent rapid quality toggling
+    - Sends SET_QUALITY commands when state changes
+
+  backend/src/metrics_logger.py
+    - Logs all metrics to per-session CSV files in backend/logs/
+
+  backend/src/config.py
+    - Tunable thresholds: FAST_MOTION_THRESHOLD_DPS = 120
+    - 5 quality levels: VERY_LOW (320x240, 400kbps) to ULTRA (1080p, 4Mbps)
+
+NETWORKING CHALLENGE
+  Laptop is behind a router with no port forwarding. MentraCloud needs a
+  public URL to deliver events to our app. Solution: ngrok tunnel.
+    ngrok: https://<random>.ngrok-free.dev --> localhost:3000
+  URL changes every boot and must be manually updated at console.mentra.glass.
+
+LIMITATIONS DISCOVERED
+  - Twitch has no ingest API: cannot measure actual delivered bitrate
+  - Cannot verify whether quality changes have the intended effect on the stream
+  - Public stream: cannot control who views it
+  - ngrok free tier: URL changes every boot
+  - MentraCloud is still in the path: ~3208ms startup delay present
+
+
+================================================================================
+PIPELINE 2 — MEDIAMTX / GOOGLE CLOUD METRICS PIPELINE
+================================================================================
+
+Files:     mentra-app/   (Node.js, TypeScript — modified)
+           backend/      (Python — modified)
+           Google Cloud VM (MediaMTX server)
+Architecture doc: ARCHITECTURE_MEDIAMTX.txt / ARCHITECTURE_MEDIAMTX_2026-04-01.txt
+
+PURPOSE
+  Replace Twitch with a self-hosted private media server that exposes a REST
+  API, enabling precise measurement of ingest bitrate, delivery bitrate, and
+  stream startup latency. Shift focus from adaptive quality control to
+  comprehensive metrics collection.
+
+DATA FLOW
+  Glasses --> MentraCloud --> Node.js App (laptop:3000, via ngrok)
+                  |                   |
+                  | RTMP              | WebSocket (port 8765)
+                  v                   v
+         MediaMTX VM             Python Metrics Backend
+         (136.116.71.233:1935)   (backend/src/)
+                  |
+                  | REST API poll every 2s (/v3/paths/list)
+                  v
+         Node.js collects server-side metrics
+                  |
+                  | PERF message (WebSocket)
+                  v
+         Python Backend logs to CSV
+                  |
+                  | HLS output (:8888)
+                  v
+         Viewer (VLC / ffplay)
+
+WHAT CHANGED FROM PIPELINE 1
+
+  mentra-app/src/MediaMTXClient.ts  (NEW FILE)
+    - Polls MediaMTX REST API at http://136.116.71.233:9997/v3/paths/list
+      every 2 seconds
+    - Extracts: bytesReceived, bytesSent, ready state, active readers
+    - Computes encoded_bitrate_bps and delivered_bitrate_bps from byte deltas
+    - Records mediamtx_ingest_latency_ms (time from startStream() to ready=true)
+
+  mentra-app/src/index.ts  (MODIFIED)
+    - Removed adaptive quality logic (Mentra SDK handles quality natively)
+    - Added MediaMTXClient integration
+    - Added battery drain rate computation
+    - Added motion intensity event counting
+
+  mentra-app/src/StreamManager.ts  (MODIFIED)
+    - Now targets rtmp://136.116.71.233:1935/live/stream instead of Twitch
+    - Added startup_delay_ms measurement
+    - Added video_freeze_count and bitrate_oscillation_bps tracking
+    - Added frame_drop_ratio derived metric
+
+  mentra-app/.env  (MODIFIED)
+    - RTMP_URL changed from Twitch to MediaMTX VM
+    - Added MEDIAMTX_HOST, MEDIAMTX_PORT, MEDIAMTX_PATH
+
+  backend/src/adaptation_controller.py  (MODIFIED)
+    - Removed quality adaptation logic
+    - Now receives PERF messages from Node.js and passes to metrics logger
+    - Added PING/PONG RTT measurement
+
+  backend/src/metrics_logger.py  (MODIFIED)
+    - Expanded CSV columns with all new metrics
+    - Added MediaMTX server-side columns
+    - Added battery drain rate, motion intensity, jitter columns
+
+  Google Cloud VM  (NEW INFRASTRUCTURE)
+    - e2-micro VM (free tier), static IP 136.116.71.233
+    - MediaMTX v1.9.1 running as systemd service
+    - /etc/mediamtx.yml: RTMP ingest (:1935), HLS (:8888), API (:9997)
+    - Stream recording enabled to /home/johncobioinfo/recordings/ (fmp4 format)
+    - Firewall rules opened for ports 1935, 8888, 9997
+
+NEW METRICS VS PIPELINE 1
+  Pipeline 1: quality_level, motion_state, cmd_latency_ms (11 columns)
+  Pipeline 2: adds mediamtx_encoded_bitrate_bps, mediamtx_delivered_bitrate_bps,
+              mediamtx_bytes_received, mediamtx_bytes_sent, mediamtx_active_readers,
+              mediamtx_ready, mediamtx_ingest_latency_ms, startup_delay_ms,
+              video_freeze_count, bitrate_oscillation_bps, frame_drop_ratio,
+              glasses_battery_level, battery_drain_rate_pct_per_min,
+              motion_intensity_events_per_min, client_rtt_ms, jitter_ms
+              (30+ columns total)
+
+LIMITATIONS DISCOVERED
+  - MentraCloud still in path — 3208ms startup delay still present
+  - MentraCloud relay adds additional ~817ms on top of that
+  - No way to measure Bluetooth hop (glasses→phone) — SDK black box
+  - No way to reduce startup delay — hardcoded in MentraCloud relay
+  - ngrok still required and URL still changes on every boot
+
+
+================================================================================
+PIPELINE 3 — MENTRACLOUD BYPASS (CURRENT)
+================================================================================
+
+Files:     glasses_ws_server/server.py  (NEW — replaces MentraCloud)
+           mentraos-mobile/             (NEW — modified MentraOS phone app)
+Architecture doc: UPDATE_2026-04-09.txt, UPDATE_2026-04-15.txt
+
+PURPOSE
+  Eliminate MentraCloud from the pipeline entirely. By hosting our own
+  WebSocket server that speaks the same protocol as MentraCloud, we can
+  direct the stream ourselves — removing the artificial relay delays and
+  gaining precise timestamps at every hop.
+
+DATA FLOW
+  Glasses <--Bluetooth--> Phone (modified MentraOS app)
+                               |
+                               | ws://192.168.86.197:8766/glasses-ws
+                               v
+                     glasses_ws_server/server.py  (laptop, no delays)
+                               |
+                               | sends start_stream command immediately
+                               v
+                    Phone pushes RTMP directly to MediaMTX VM
+                               |
+                               v
+                    MediaMTX VM (136.116.71.233:1935)
+                               |
+                               v
+                    HLS / RTMP direct playback + recording
+
+WHAT CHANGED FROM PIPELINE 2
+
+  glasses_ws_server/server.py  (NEW FILE — replaces MentraCloud entirely)
+    - Written in Python using aiohttp (handles both REST and WebSocket on one port)
+    - Implements the full MentraCloud WebSocket protocol (from SocketComms.ts source)
+    - REST endpoints served (required by the phone app before connecting):
+        POST /auth/exchange-token            → {"coreToken":"bypass-token"}
+        POST /api/client/min-version         → {"required":"0.0.0"}
+        POST /api/client/apps                → {"data":[]}
+        POST /api/client/device/state        → {"success":true}
+        POST /api/auth/generate-webview-token → {"data":{"token":"bypass-token"}}
+        GET  /api/client/user/settings       → {"data":{}}
+        (+ others)
+    - WebSocket messages handled:
+        RECV ping                 → sends pong (keepalive)
+        RECV glasses_battery_update → triggers start_stream immediately
+        RECV rtmp_stream_status   → logs stream state transitions
+        RECV head_position        → logs head motion events
+        SEND connection_ack       → sent immediately on phone connect
+        SEND start_stream         → sent on battery update or after 3s fallback
+        SEND keep_stream_alive    → sent every 10s while streaming
+    - Latency timestamps recorded at every event:
+        phone_connected, connection_ack_sent, glasses_connected,
+        start_stream_sent, stream_active, mediamtx_ready, phone_disconnected
+    - Polls MediaMTX REST API every 2s (same as Pipeline 2 Node.js client)
+    - Logs three CSV files per session:
+        *_bypass_latency.csv      — per-event timestamps
+        *_bypass_performance.csv  — 2s metrics snapshots
+        *_bypass_stream_events.csv — stream status changes
+    - No ngrok needed — phone connects directly to laptop local IP
+
+  mentraos-mobile/  (MODIFIED FROM OPEN-SOURCE MENTRAOS)
+    - Source: cloned from github.com/Mentra-Community/MentraOS /mobile folder
+    - One change in .env:
+        EXPO_PUBLIC_BACKEND_URL_OVERRIDE=http://192.168.86.197:8766
+      This single variable redirects ALL server communication from
+      api.mentraglass.com to our custom server.
+    - Built locally with Gradle (not EAS cloud build)
+    - Sideloaded onto phone via WiFi ADB (adb pair + adb connect)
+    - Package name: com.mentra.mentra (same as official — requires uninstall first)
+
+  mentra-app/ and backend/  (UNCHANGED)
+    - Pipeline 2 components still work for comparison baseline sessions
+    - Run on different ports (3000, 8765) — do not conflict with Pipeline 3
+
+WHAT IS ELIMINATED VS PIPELINE 2
+  - MentraCloud relay server (api.mentraglass.com) — completely removed
+  - ngrok tunnel — not needed; phone connects to local IP directly
+  - sleep 2 delay in MentraCloud relay — eliminated
+  - FFmpeg -analyzeduration probe in MentraCloud relay — eliminated
+  - Node.js app server — not used in Pipeline 3
+
+LATENCY RESULTS (first session, 2026-04-15)
+
+  Metric                      Pipeline 3 Bypass   Pipeline 2 Baseline   Delta
+  --------------------------  ------------------  --------------------  ----------
+  Stream startup delay        2820ms              3208ms                -388ms (-12%)
+  MediaMTX ingest latency     1566ms              4025ms                -2459ms (-61%)
+  Viewer latency (RTMP)       ~2-3s               ~13s (HLS)            ~10s improvement
+
+  The 61% ingest latency reduction confirms MentraCloud's relay was the
+  dominant source of delay — not the hardware or network.
+
+  Remaining ~2820ms startup is firmware-level: the glasses buffer video
+  locally before pushing RTMP (Mentra's documented prebuffer behavior).
+  This cannot be changed without modifying the glasses firmware.
+
+  Viewer latency improvement: switching from HLS (6-8s segment buffer) to
+  direct RTMP playback with ffplay eliminates buffering entirely.
+    ffplay -fflags nobuffer -flags low_delay -framedrop \
+      rtmp://136.116.71.233:1935/live/stream
+
+
+================================================================================
+SIDE-BY-SIDE COMPARISON
+================================================================================
+
+                           ORIGINAL        PIPELINE 1      PIPELINE 2       PIPELINE 3
+                           MentraOS        Twitch/NGINX    MediaMTX Cloud   Bypass
+  ─────────────────────────────────────────────────────────────────────────────────────
+  RTMP Destination         Any (Twitch)    Twitch          MediaMTX VM      MediaMTX VM
+  MentraCloud in path?     Yes             Yes             Yes              NO
+  ngrok required?          Yes             Yes             Yes              No
+  Startup delay            ~3208ms         ~3208ms         ~3208ms          ~2820ms
+  Ingest latency           ~4025ms         N/A             ~4025ms          ~1566ms
+  Viewer latency           N/A             ~10s (Twitch)   ~13s (HLS)       ~2-3s (RTMP)
+  Quality adaptation?      No              Yes             No               No
+  Metrics collected?       No              Basic           Comprehensive    Latency-focused
+  Server language          —               Node.js + Py    Node.js + Py     Python only
+  Phone app modified?      No              No              No               Yes (1 line .env)
+  Can measure ingest bps?  No              No              Yes              Yes
+  Session recordings?      No              No              Yes (fmp4)       Yes (fmp4)
+
+  KEY NEW FILES PER PIPELINE
+  ─────────────────────────────────────────────────────────────────────────────────────
+  Pipeline 1:  mentra-app/src/index.ts, StreamManager.ts, BackendClient.ts
+               backend/src/adaptation_controller.py, metrics_logger.py, config.py
+
+  Pipeline 2:  mentra-app/src/MediaMTXClient.ts  (new)
+               All Pipeline 1 files modified for metrics-only mode
+               Google Cloud VM + MediaMTX (new infrastructure)
+
+  Pipeline 3:  glasses_ws_server/server.py  (new — replaces MentraCloud)
+               mentraos-mobile/.env  (1-line change from open-source)
+               No Node.js app — Python server handles everything directly
+
+
+================================================================================
+CODE VOLUME SUMMARY
+================================================================================
+
+  Original MentraOS (relevant parts):
+    /mobile           ~15,000 lines (React Native, TypeScript)
+    /cloud/rtmp_relay ~200 lines (shell scripts)
+
+  Our additions/modifications:
+    Pipeline 1:  ~900 lines new (Node.js + Python)
+    Pipeline 2:  ~600 lines added on top of Pipeline 1
+    Pipeline 3:  ~350 lines new (glasses_ws_server/server.py)
+                 1 line changed in mentraos-mobile/.env

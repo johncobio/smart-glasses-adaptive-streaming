@@ -1,0 +1,6 @@
+timestamp_iso,event,elapsed_from_start_ms,elapsed_from_prev_ms,notes
+2026-04-16T13:39:17.918819,phone_connected,0.0,0.0,client=192.168.86.249
+2026-04-16T13:39:17.919028,connection_ack_sent,0.2,0.2,
+2026-04-16T13:39:20.920271,glasses_connected,3001.4,3001.2,fallback — no battery update in 3s
+2026-04-16T13:39:20.920833,start_stream_sent,3002.0,0.6,rtmpUrl=rtmp://136.116.71.233:1935/live/stream
+2026-04-16T13:41:20.787122,phone_disconnected,122868.3,119866.3,

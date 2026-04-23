@@ -1,0 +1,4 @@
+timestamp_iso,event,elapsed_from_start_ms,elapsed_from_prev_ms,notes
+2026-04-15T17:59:18.446057,phone_connected,0.0,0.0,client=192.168.86.249
+2026-04-15T17:59:18.446385,connection_ack_sent,0.3,0.3,
+2026-04-15T18:01:09.338261,phone_disconnected,110892.2,110891.9,

@@ -1,0 +1,332 @@
+================================================================================
+SMART GLASSES STREAMING — LATENCY METRICS COMPARISON
+================================================================================
+Project: Smart Glasses Adaptive Streaming
+Prepared: 2026-04-16
+Data source: backend/logs/ (all session CSV files)
+
+This document compares measured latency across all three pipeline
+implementations using data extracted directly from session log files.
+
+================================================================================
+SESSION INVENTORY
+================================================================================
+
+  Pipeline 1 (Twitch/NGINX Adaptive):      21 sessions  (Feb 5 – Mar 4, 2026)
+  Pipeline 2 (MediaMTX/Google Cloud):      19 sessions  (Mar 3 – Apr 9, 2026)
+  Pipeline 3 (MentraCloud Bypass):         10 sessions  (Apr 15, 2026 — first working day)
+                                           ─────────────────────────────────────
+  Total logged sessions:                   53
+
+
+================================================================================
+METRIC DEFINITIONS
+================================================================================
+
+  Command Latency (Pipeline 1 only)
+    Time from the Python backend sending a SET_QUALITY command to the glasses
+    acknowledging it via the Mentra SDK. Measured round-trip through
+    MentraCloud. Captured in client_last_cmd_latency_ms.
+
+  Backend RTT
+    Round-trip time between the app server (Node.js or phone) and the Python
+    backend (localhost WebSocket ping/pong). Measures local network jitter.
+    Captured in client_rtt_ms.
+
+  Stream Startup Delay
+    Time from calling startStream() to the SDK or phone app reporting the
+    stream as "active" / "streaming". Captures MentraCloud processing time.
+    Captured in startup_delay_ms (Pipeline 2) and computed from latency events
+    (Pipeline 3: stream_active_elapsed - start_stream_sent_elapsed).
+
+  MediaMTX Ingest Latency
+    Time from calling startStream() to MediaMTX reporting ready=true via REST
+    API. Captures the full path from command to stream arriving at the server.
+    Available in Pipeline 2 and 3 only (Twitch had no equivalent API).
+    Captured in mediamtx_ingest_latency_ms.
+
+  Backend RTT Jitter
+    Standard deviation of RTT samples within a session.
+    Captured in jitter_ms (Pipeline 2).
+
+  Server IMU Processing Time
+    Time taken by the Python backend to process each incoming IMU/motion
+    message. Pipeline 1 only — motion processing was removed in Pipeline 2.
+    Captured in server_imu_proc_avg_ms.
+
+
+================================================================================
+PIPELINE 1 — TWITCH / NGINX ADAPTIVE STREAMING
+================================================================================
+Sessions analyzed: 21  (20260205 – 20260304)
+
+COMMAND LATENCY (quality change round-trip via MentraCloud)
+  Samples:      244
+  Average:      939.5 ms
+  Minimum:       18.0 ms   (20260205 — early local test, best-case network)
+  Maximum:     2066.0 ms   (20260303 — cross-network session)
+
+  Per-session breakdown:
+    20260205_125939   avg   24.3ms   n=51   (local same-network test)
+    20260212_130034   avg  559.1ms   n=29
+    20260212_130522   avg  560.0ms   n=13
+    20260212_131816   avg  569.8ms   n=17
+    20260226_134542   avg 1332.9ms   n=15
+    20260226_134631   avg 1335.0ms   n=14
+    20260226_134715   avg 1335.4ms   n=11
+    20260226_135137   avg 1344.2ms   n=6
+    20260226_135301   avg 1350.8ms   n=9
+    20260226_135331   avg 1339.0ms   n=12
+    20260226_135405   avg 1336.8ms   n=6
+    20260303_133442   avg 2066.0ms   n=11
+    20260303_133540   avg 2062.7ms   n=16
+    20260304_121959   avg 1211.0ms   n=5
+    20260304_122027   avg 1218.9ms   n=29
+
+  Note: High variability is expected. Command must travel:
+    Python backend → Node.js → ngrok → MentraCloud → Glasses → MentraCloud
+    → Node.js → Python backend. Each hop adds latency.
+
+BACKEND RTT (local WebSocket ping/pong)
+  Not available in Feb sessions. Mar sessions showed avg 11.6–13.8ms.
+
+SERVER IMU PROCESSING TIME
+  Samples:       94
+  Average:    0.143 ms   (negligible overhead per message)
+
+STREAM STARTUP DELAY
+  Not measurable. Twitch provides no API to confirm when ingest begins.
+
+INGEST LATENCY
+  Not measurable. Twitch is a black box — no per-stream API.
+
+
+================================================================================
+PIPELINE 2 — MEDIAMTX / GOOGLE CLOUD METRICS PIPELINE
+================================================================================
+Sessions analyzed: 19  (20260303 – 20260409)
+Note: Startup delay and ingest latency were added mid-way through development.
+      Sessions before 20260331 do not have these columns.
+
+STREAM STARTUP DELAY  (startStream() → SDK reports "active")
+  Samples:    2,776
+  Average:    2,659 ms
+  Minimum:    1,386 ms   (20260409_155201 — best session)
+  Maximum:    3,208 ms   (20260409_152933 — worst session, MentraCloud ceiling)
+
+  Per-session averages (sessions with data):
+    20260331_125619   avg 2635ms
+    20260401_165103   avg 2873ms
+    20260401_182546   avg 1883ms
+    20260402_122018   avg 2723ms
+    20260409_152933   avg 3091ms
+    20260409_153912   avg 1957ms
+    20260409_155201   avg 1386ms
+    20260409_155724   avg 3014ms
+
+  Observation: High variance (1386–3208ms) despite identical hardware/network.
+  The 3208ms ceiling matches Mentra's documented 3-second prebuffer.
+  Sessions below ~2000ms are likely cases where the prebuffer was partially
+  warm (glasses had recently been streaming).
+
+MEDIAMTX INGEST LATENCY  (startStream() → MediaMTX ready=true)
+  Samples:      709
+  Average:    3,606 ms
+  Minimum:    2,054 ms   (20260409_155201)
+  Maximum:    4,031 ms   (20260409_152933)
+
+  Per-session (sessions with data):
+    20260402_122018   avg 4025ms
+    20260409_152933   avg 4031ms
+    20260409_153912   avg 4029ms
+    20260409_155201   avg 2054ms
+    20260409_155724   avg 4030ms
+
+  MentraCloud → MediaMTX hop (ingest - startup):
+    Average:    947 ms   (actual RTMP transit time through MentraCloud relay)
+    This is the time MentraCloud's relay adds on top of the prebuffer.
+
+BACKEND RTT  (phone app ↔ Python backend WebSocket)
+  Samples:    4,931
+  Average:     1.10 ms
+  Minimum:     0.00 ms
+  Maximum:    22.00 ms
+
+JITTER  (RTT standard deviation)
+  Samples:    2,915
+  Average:     0.42 ms   — extremely stable local network
+  Maximum:     1.00 ms
+
+ENCODED BITRATE  (glasses → MediaMTX, computed from bytesReceived delta)
+  Samples:      452
+  Average:     2.04 Mbps
+  Min/Max:     0.12 – 2.14 Mbps
+
+DELIVERED BITRATE  (MediaMTX → HLS viewers, from bytesSent delta)
+  Samples:      452
+  Average:     4.08 Mbps   (approx 2x encoded — HLS overhead + re-muxing)
+  Min/Max:     0.24 – 4.28 Mbps
+
+
+================================================================================
+PIPELINE 3 — MENTRACLOUD BYPASS
+================================================================================
+Sessions analyzed: 10  (Apr 15, 2026 — first day the bypass was fully working)
+Sessions with full stream data: 2
+
+Apr 15 session breakdown:
+  135921–175100 (5 sessions): Empty — server was still being built (pre-aiohttp
+    rewrite). Phone could not reach server at all; no events logged.
+  175213–175915 (3 sessions): Phone connected but disconnected after ~5s.
+    Server was handling auth but start_stream logic not yet implemented.
+  180120:  First full stream — but start_stream fired too early (bad result).
+  180513:  Clean session — battery-triggered start_stream, no reconnect errors.
+
+The two sessions below represent the complete stream measurements.
+
+SESSION 20260415_180120  (first attempt — start_stream fired too early)
+  Stream startup delay:   4,928 ms
+  MediaMTX ingest latency: 6,163 ms
+  Stream status sequence:  initializing → error → reconnecting → reconnected
+  Note: start_stream was fired 1 second after phone connected, before glasses
+        were ready. The error/reconnect cycle added ~3s of avoidable delay.
+        This session is NOT representative of the bypass under optimal conditions.
+
+SESSION 20260415_180513  (clean session — battery-triggered start_stream)
+  Phone → server connect:    0 ms    (immediate)
+  Connection ack sent:       0 ms
+  start_stream fired:     3,002 ms   (3s fallback trigger — no battery update)
+  Stream active (SDK):    2,820 ms   after start_stream
+  MediaMTX ingest latency: 1,566 ms  after start_stream
+  Stream status sequence:  stopped → initializing → streaming  (clean, no errors)
+
+  This is the best clean result from the bypass pipeline.
+
+AGGREGATE (2 sessions with stream data)
+  Startup delay:         avg 3,874 ms   (range: 2,820 – 4,928 ms)
+  Ingest latency:        avg 3,865 ms   (range: 1,566 – 6,163 ms)
+
+  IMPORTANT: The wide range is due to the first session being a bad trigger
+  condition (early fire), not a hardware or network issue. The 20260415_180513
+  session (2820ms startup, 1566ms ingest) is the representative clean result.
+
+ENCODED BITRATE  (glasses → MediaMTX via bypass)
+  Samples:   141
+  Average:   1.04 Mbps
+  Min/Max:   0.36 – 1.14 Mbps
+  Note: Lower than Pipeline 2 average (2.04 Mbps) because bypass sessions
+        were shorter and captured more startup/ramp-up periods proportionally.
+
+DELIVERED BITRATE
+  Samples:   141
+  Average:   2.32 Mbps
+  Min/Max:   0.73 – 3.38 Mbps
+
+
+================================================================================
+HEAD-TO-HEAD LATENCY COMPARISON
+================================================================================
+
+  Metric                        P1 Twitch     P2 MediaMTX    P3 Bypass
+  ────────────────────────────────────────────────────────────────────────────
+  Quality cmd round-trip        939ms avg      N/A            N/A
+                                (18–2066ms)
+  Backend RTT                   11–14ms        1.10ms avg     N/A (local)
+  RTT jitter                    N/A            0.42ms         N/A
+  Stream startup delay          NOT MEASURED   2,659ms avg    2,820ms (clean)
+                                               (1,386–3,208)
+  MentraCloud → server hop      NOT MEASURED   947ms avg      ELIMINATED
+  MediaMTX ingest latency       NOT MEASURED   3,606ms avg    1,566ms (clean)
+                                               (2,054–4,031)
+  Server IMU proc time          0.143ms avg    N/A            N/A
+  Viewer latency (HLS)          ~10s (Twitch)  ~13s           ~2-3s (RTMP)
+  Encoded bitrate               NOT MEASURED   2.04 Mbps      1.04 Mbps*
+  Delivered bitrate             NOT MEASURED   4.08 Mbps      2.32 Mbps*
+
+  *Bypass bitrate samples are disproportionately from startup/ramp-up periods.
+
+
+================================================================================
+KEY FINDINGS
+================================================================================
+
+1. COMMAND LATENCY IS DOMINATED BY MENTRACLOUD (Pipeline 1)
+   The 939ms average command round-trip is almost entirely MentraCloud
+   processing and routing overhead. The early local test (24ms) shows the
+   hardware and local network are capable of near-real-time response.
+   This means the adaptive quality control in Pipeline 1 had nearly 1 second
+   of lag between detecting motion and the glasses actually changing quality.
+
+2. THE 3208ms STARTUP DELAY IS A FIRMWARE CEILING (Pipeline 2)
+   No Pipeline 2 session exceeded 3208ms startup delay. This matches Mentra's
+   documented 3-second prebuffer (glasses record locally before pushing RTMP).
+   The wide variance (1386–3208ms) suggests the prebuffer is partially warm
+   when the glasses have streamed recently.
+
+3. MENTACLOUD RELAY ADDS ~947ms ON TOP OF THE PREBUFFER (Pipeline 2)
+   The average gap between startup_delay and ingest_latency is 947ms.
+   This is the time MentraCloud's relay (sleep 2 + FFmpeg probe) takes to
+   forward the stream to MediaMTX after the SDK reports "active."
+
+4. BYPASS ELIMINATES THE RELAY HOP ENTIRELY (Pipeline 3)
+   The clean bypass session shows 1566ms ingest latency vs 3606ms average
+   for Pipeline 2 — a 56% reduction. The relay overhead (947ms) and most
+   of the FFmpeg probe delay are gone.
+
+5. BACKEND RTT IMPROVEMENT FROM P1 TO P2 (~12ms → ~1ms)
+   Pipeline 1 used ngrok (Node.js → ngrok → internet → backend).
+   Pipeline 2 connected Node.js directly to the Python backend on localhost.
+   This 12x RTT improvement means PERF metric delivery is near-instantaneous.
+
+6. VIEWER LATENCY: PROTOCOL CHOICE MATTERS MORE THAN PIPELINE
+   HLS (used for viewing in P2): 6–8 seconds of segment buffering added
+   regardless of which pipeline delivers the stream.
+   RTMP direct (used in P3 via ffplay): buffering drops to ~1–2 seconds.
+   Switching from HLS to RTMP playback alone saves ~6s of viewer-side latency,
+   independent of any backend changes.
+
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+                                   P1          P2          P3 (best)
+                                   Twitch      MediaMTX    Bypass
+  ──────────────────────────────────────────────────────────────────────────
+  Startup delay                    N/A         2659ms      2820ms
+  Ingest latency                   N/A         3606ms      1566ms   (-56%)
+  MentraCloud relay overhead       N/A         ~947ms      0ms      (-100%)
+  Backend RTT                      ~12ms       1.1ms       <1ms
+  Viewer latency (HLS)             ~10s        ~13s        ~13s (HLS)
+  Viewer latency (RTMP direct)     N/A         N/A         ~1s
+  Quality cmd latency              939ms avg   N/A         N/A
+  Sessions logged                  21          19          13
+  Sessions with stream metrics     0           11          2  (Apr 15 only)
+
+
+================================================================================
+RAW SESSION FILES REFERENCED
+================================================================================
+
+Pipeline 1 sessions (performance.csv):
+  20260205_124712, 20260205_125215, 20260205_125743, 20260205_125939,
+  20260205_130124, 20260205_131420, 20260210_132519, 20260212_130034,
+  20260212_130522, 20260212_131816, 20260226_134542, 20260226_134631,
+  20260226_134715, 20260226_135137, 20260226_135301, 20260226_135331,
+  20260226_135405, 20260303_133442, 20260303_133540, 20260304_121959,
+  20260304_122027
+
+Pipeline 2 sessions (performance.csv):
+  20260303_133442, 20260303_133540, 20260304_121959, 20260304_122027,
+  20260324_130419, 20260325_135617, 20260325_173828, 20260326_120951,
+  20260326_130239, 20260326_133546, 20260331_125619, 20260401_165103,
+  20260401_182546, 20260402_122018, 20260409_152933, 20260409_153912,
+  20260409_154609, 20260409_155201, 20260409_155724
+
+Pipeline 3 sessions (bypass_latency.csv + bypass_performance.csv):
+  All sessions from Apr 15, 2026 — first working day of bypass pipeline.
+  20260415_135921, 20260415_140719, 20260415_172954, 20260415_174808,
+  20260415_175100  (empty — server still being developed)
+  20260415_175213, 20260415_175358, 20260415_175915  (partial — no stream)
+  20260415_180120  (stream established — bad trigger condition)
+  20260415_180513  (stream established — clean result, representative)

@@ -1,0 +1,274 @@
+SMART GLASSES STREAMING — STARTUP GUIDE (Bypass Pipeline)
+===========================================================
+Created:  2026-04-13
+Pipeline: Glasses → Phone → OUR server → MediaMTX VM
+Replaces: STARTUP_GUIDE_MEDIAMTX.txt for bypass sessions
+
+This guide covers the new bypass pipeline that eliminates MentraCloud
+entirely, reducing startup latency from ~3208ms to an expected <800ms.
+
+For the original MentraCloud pipeline (baseline comparison sessions),
+use STARTUP_GUIDE_MEDIAMTX.txt instead.
+
+
+PRE-FLIGHT CHECKLIST
+--------------------
+[ ] Phone and laptop are on the SAME Wi-Fi network (192.168.86.x)
+[ ] Google Cloud VM is running (136.116.71.233)
+[ ] MediaMTX is running on the VM (auto-starts on boot)
+[ ] Mentra glasses are powered on and paired to the phone via Bluetooth
+[ ] Python dependencies installed: pip install websockets
+
+
+STEP 0 — VERIFY MEDIAMTX IS RUNNING ON THE GOOGLE CLOUD VM
+------------------------------------------------------------
+MediaMTX auto-starts on VM boot. Verify it is healthy:
+
+    curl http://136.116.71.233:9997/v3/paths/list
+
+Expected response when no stream is active:
+    {"itemCount":0,"pageCount":0,"items":[]}
+
+If that times out, the VM may be off. Start it in Google Cloud Console
+or via Cloud Shell:
+    gcloud compute ssh mediamtx-server --zone=us-central1-a
+    sudo systemctl start mediamtx
+
+
+STEP 1 — START THE BYPASS SERVER  (Terminal 1)
+----------------------------------------------
+cd ~/smart-glasses-adaptive-streaming-v2/glasses_ws_server
+python3 server.py
+
+You should see:
+    ============================================================
+    Custom MentraOS WebSocket Server
+    ============================================================
+    Listening on:  ws://0.0.0.0:8766/glasses-ws
+    RTMP target:   rtmp://136.116.71.233:1935/live/stream
+    MediaMTX API:  http://136.116.71.233:9997
+    Logs:          .../backend/logs
+    ============================================================
+    Waiting for phone app connection...
+
+Leave this running. All session events are printed here in real time.
+
+
+STEP 2 — POINT THE PHONE APP AT YOUR SERVER
+--------------------------------------------
+Two options — try Option A first (no APK install needed):
+
+  OPTION A — Developer Settings in the official app (recommended)
+  ---------------------------------------------------------------
+  1. Open the MentraOS app on the phone
+  2. Tap the Account tab (bottom navigation)
+  3. Scroll down → tap "Developer Settings"
+  4. Find the "Backend URL" field
+  5. Set it to:  http://192.168.86.197:8766
+     (replace IP if your laptop's LAN IP changed — run: hostname -I)
+  6. Save / reconnect
+
+  OPTION B — Sideload the custom APK (if Option A is unavailable)
+  ---------------------------------------------------------------
+  The APK was built via EAS cloud build on 2026-04-13.
+  If you have the downloaded APK:
+    adb install /path/to/mentraos-bypass.apk
+  Then open the app, log into your Mentra account, connect glasses.
+  The app talks to your server automatically (URL baked in at build time).
+
+  To rebuild the APK:
+    cd ~/smart-glasses-adaptive-streaming-v2/mentraos-mobile
+    eas build --platform android --profile preview --non-interactive
+
+
+STEP 3 — CONNECT THE GLASSES
+-----------------------------
+With the phone app pointing to your server and the server running:
+
+  - Open the MentraOS app on the phone
+  - Connect the Mentra glasses via Bluetooth as normal
+  - Streaming starts automatically — no manual start needed
+
+Watch Terminal 1 for this sequence:
+    [SERVER] Phone app connected: 192.168.86.X:XXXXX  path=/glasses-ws
+    [SERVER] Sent connection_ack
+    [LATENCY] phone_connected:     +0ms from start
+    [LATENCY] connection_ack_sent: +Xms from start
+    [LATENCY] glasses_connected:   +Xms from start     ← BT handshake done
+    [LATENCY] start_stream_sent:   +Xms from start     ← we fire instantly
+    [STREAM]  Status: streaming
+    [LATENCY] stream_active:       +Xms from start     ← startup_delay_ms
+    [LATENCY] mediamtx_ready:      +Xms from start     ← stream on VM
+
+
+STEP 4 — VERIFY STREAM REACHED MEDIAMTX
+-----------------------------------------
+In a new terminal:
+    curl http://136.116.71.233:9997/v3/paths/list | python3 -m json.tool
+
+Look for:  "ready": true   under the live/stream path.
+
+Or watch the HLS stream in VLC:
+    http://136.116.71.233:8888/live/stream/index.m3u8
+
+
+STEP 5 — END SESSION
+---------------------
+Disconnect the glasses via Bluetooth or close the phone app.
+The server prints a session summary automatically:
+
+    ───────────────────────────────────────────────────────
+    SESSION SUMMARY
+    ───────────────────────────────────────────────────────
+      Metric                                   Value  Baseline
+      ─────────────────────────────────────────────────────────
+      Bluetooth handshake (phone→glasses)      210ms
+      Stream startup delay (→SDK active)       652ms   3208ms  (-2556ms)
+      MediaMTX ingest latency (→VM ready)     1209ms   4025ms
+      ─────────────────────────────────────────────────────────
+      RESULT: 2556ms saved vs baseline (80% reduction)
+
+    Logs saved to:
+      20260413_120000_bypass_performance.csv
+      20260413_120000_bypass_latency.csv
+      20260413_120000_bypass_stream_events.csv
+
+Press Ctrl+C in Terminal 1 to stop the server.
+
+
+STEP 6 — ANALYZE RESULTS
+--------------------------
+After the session, analyze the latency event log:
+
+    # Single session — event-level timeline
+    python3 backend/src/analyze_bypass_latency.py \
+      --log backend/logs/YYYYMMDD_HHMMSS_bypass_latency.csv
+
+    # All bypass sessions — includes cross-session comparison table
+    python3 backend/src/analyze_bypass_latency.py --dir backend/logs/
+
+    # Performance CSV (bitrate, battery, head position over time)
+    python3 backend/src/analyze_latency.py \
+      --log backend/logs/YYYYMMDD_HHMMSS_bypass_performance.csv
+
+    # Compare startup delay across multiple bypass sessions
+    python3 backend/src/analyze_bypass_latency.py --compare \
+      backend/logs/session1_bypass_latency.csv \
+      backend/logs/session2_bypass_latency.csv
+
+
+WHAT TO EXPECT IN TERMINAL 1 (during session)
+---------------------------------------------
+    [LATENCY]  phone_connected:     +0ms
+    [LATENCY]  connection_ack_sent: +2ms
+    [BATTERY]  87%
+    [LATENCY]  glasses_connected:   +210ms     ← Bluetooth handshake
+    [LATENCY]  start_stream_sent:   +211ms     ← our reaction: ~1ms
+    [STREAM]   Status: streaming
+    [LATENCY]  stream_active:       +863ms     ← startup_delay=652ms
+    [LATENCY]  mediamtx_ready:      +1420ms    ← ingest_latency=1209ms
+    [HEAD]     Position: down
+    [HEAD]     Position: up
+
+
+LOG FILES PRODUCED (backend/logs/)
+------------------------------------
+  YYYYMMDD_HHMMSS_bypass_latency.csv
+    Per-event timestamps: phone_connected, glasses_connected,
+    start_stream_sent, stream_active, mediamtx_ready.
+    This is the PRIMARY latency comparison file.
+
+  YYYYMMDD_HHMMSS_bypass_performance.csv
+    2-second snapshots: glasses_connected, stream_status, battery,
+    head_position, mediamtx bitrate/bytes/readers, startup_delay_ms,
+    mediamtx_ingest_latency_ms, server_processing_ms.
+
+  YYYYMMDD_HHMMSS_bypass_stream_events.csv
+    Every stream status change with timestamp.
+
+
+TROUBLESHOOTING
+---------------
+Phone app won't connect to server:
+    - Verify both phone and laptop are on the SAME Wi-Fi
+    - Run: hostname -I  to confirm laptop IP is 192.168.86.197
+    - Check server is running and shows "Waiting for phone app connection"
+    - If on different networks, use ngrok:
+        ngrok http 8766
+        Then set backend URL to the ngrok HTTPS URL in the app
+
+Server starts but glasses never connect:
+    - Check that start_stream_sent was logged — if not, glasses_connected
+      never fired. Verify Bluetooth is paired in the phone app.
+    - Try disconnecting and reconnecting glasses in the app
+
+stream_active never logs (glasses_connected did):
+    - The RTMP push from glasses to MediaMTX failed
+    - Check VM is running: curl http://136.116.71.233:9997/v3/paths/list
+    - Check RTMP port is open: nc -zv 136.116.71.233 1935
+
+mediamtx_ready never logs:
+    - MediaMTX API port 9997 may be blocked
+    - Test: curl http://136.116.71.233:9997/v3/paths/list
+    - If timeout: re-add the GCP firewall rule for tcp:9997
+
+Session summary shows startup > 3208ms:
+    - MentraCloud delay may still be in the path (Option B APK issue)
+    - Confirm backend URL is set to YOUR server, not api.mentraglass.com
+
+bun install failed (preinstall error):
+    - Already fixed (preinstall replaced with echo stub)
+    - If it re-appears: manually remove preinstall from package.json scripts
+
+eas build fails (missing profile):
+    - Profile "preview" exists in eas.json — check you're in mentraos-mobile/
+    - Ensure you're logged in: eas whoami
+
+
+KEY FILE LOCATIONS
+------------------
+Bypass server:              glasses_ws_server/server.py
+Server config:              glasses_ws_server/.env
+Server config template:     glasses_ws_server/.env.example
+Mobile setup script:        setup_mentraos_mobile.sh
+Mobile source:              mentraos-mobile/
+Mobile server URL config:   mentraos-mobile/.env
+  (EXPO_PUBLIC_BACKEND_URL_OVERRIDE=http://192.168.86.197:8766)
+Session CSV logs:           backend/logs/
+Latency event analyzer:     backend/src/analyze_bypass_latency.py
+Performance analyzer:       backend/src/analyze_latency.py
+Battery/thermal analyzer:   backend/src/analyze_battery_thermal.py
+This guide:                 STARTUP_GUIDE_BYPASS.txt
+Architecture notes:         ARCHITECTURE_MEDIAMTX.txt
+4-09 update (bypass design): UPDATE_2026-04-09.txt
+4-13 update (today):         UPDATE_2026-04-13.txt
+
+
+GOOGLE CLOUD VM REFERENCE
+--------------------------
+VM Name:      mediamtx-server
+Public IP:    136.116.71.233
+Zone:         us-central1-a
+RTMP ingest:  :1935
+HLS playback: :8888
+API:          :9997  (open, no auth required)
+Recording:    /home/johncobioinfo/recordings/
+
+SSH:
+    gcloud compute ssh mediamtx-server --zone=us-central1-a
+
+MediaMTX service commands (on VM):
+    sudo systemctl status mediamtx
+    sudo systemctl restart mediamtx
+    sudo journalctl -u mediamtx -n 30 --no-pager
+
+
+BASELINE REFERENCE (MentraCloud pipeline — April 7 session)
+------------------------------------------------------------
+  Stream startup delay:      3208ms
+  MediaMTX ingest latency:   4025ms
+  App <-> backend RTT:       ~1ms
+  Cause of delay:            Mentra's 3s prebuffer + FFmpeg analyzeduration
+
+  Expected bypass result:    400–800ms startup delay
+  Expected improvement:      ~80% reduction

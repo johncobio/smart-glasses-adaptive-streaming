@@ -1,0 +1,8 @@
+timestamp_iso,event,elapsed_from_start_ms,elapsed_from_prev_ms,notes
+2026-04-15T18:05:14.705174,phone_connected,0.0,0.0,client=192.168.86.249
+2026-04-15T18:05:14.705394,connection_ack_sent,0.2,0.2,
+2026-04-15T18:05:17.706964,glasses_connected,3001.8,3001.6,fallback — no battery update in 3s
+2026-04-15T18:05:17.707496,start_stream_sent,3002.3,0.5,rtmpUrl=rtmp://136.116.71.233:1935/live/stream
+2026-04-15T18:05:19.273084,mediamtx_ready,4567.9,1565.6,"MediaMTX ready=true, ingest latency=1566ms"
+2026-04-15T18:05:20.527349,stream_active,5822.2,1254.3,startup_delay=2820ms
+2026-04-15T18:06:48.507928,phone_disconnected,93802.8,87980.6,

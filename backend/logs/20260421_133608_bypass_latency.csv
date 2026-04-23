@@ -1,0 +1,8 @@
+timestamp_iso,event,elapsed_from_start_ms,elapsed_from_prev_ms,notes
+2026-04-21T13:43:48.235368,phone_connected,0.0,0.0,client=192.168.86.247
+2026-04-21T13:43:48.235580,connection_ack_sent,0.2,0.2,
+2026-04-21T13:43:50.041783,glasses_connected,1806.4,1806.2,battery confirmed glasses ready (99%)
+2026-04-21T13:43:50.042001,start_stream_sent,1806.6,0.2,rtmpUrl=rtmp://136.116.71.233:1935/live/stream
+2026-04-21T13:43:59.262418,stream_active,11027.1,9220.4,startup_delay=9221ms
+2026-04-21T13:44:01.692458,mediamtx_ready,13457.1,2430.0,"MediaMTX ready=true, ingest latency=11651ms"
+2026-04-21T13:44:28.871174,phone_disconnected,40635.8,27178.7,

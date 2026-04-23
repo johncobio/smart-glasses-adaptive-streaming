@@ -1,0 +1,23 @@
+#!/usr/bin/env zx
+
+import { setBuildEnv } from './set-build-env.mjs';
+await setBuildEnv();
+
+// build only for real devices new arch:
+process.env.ORG_GRADLE_PROJECT_reactNativeArchitectures = 'arm64-v8a'
+
+console.log('Building Android release...');
+
+// Prebuild Android
+await $({ stdio: 'inherit' })`bun expo prebuild --platform android`;
+
+// bundle js code:
+await $({stdio: "inherit"})`bun expo export --platform android`
+
+// Build release APK
+await $({ stdio: 'inherit', cwd: 'android' })`./gradlew assembleRelease`;
+
+// Install APK on device
+await $({ stdio: 'inherit' })`adb install -r android/app/build/outputs/apk/release/app-release.apk`;
+
+console.log('✅ Android release built and installed successfully!');
